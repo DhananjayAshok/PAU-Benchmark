@@ -5,7 +5,7 @@ Benchmark for evaluating LLMs on API discovery tasks in an **interactive** setti
 
 ![PAU Benchmark](assets/PAU.jpg)
 
-**Dataset:** Anonymized (but available on HuggingFace already under the name PAU)
+**Dataset:** Anonymized (but available on HuggingFace already)
 
 ---
 
