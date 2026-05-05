@@ -1,0 +1,1060 @@
+import os
+from utils import (
+    load_parameters,
+    log_info,
+    file_makedir,
+    log_warn,
+    log_error,
+    get_test_func_header,
+    call_infer,
+    get_interactive_starting_prompt,
+    get_prev_results_str,
+    RunTestFunc,
+    model_factory,
+    get_lm,
+    call_infer,
+)
+import click
+from load_data import get_dataset, save_dataset_df, load_dataset_df
+import pandas as pd
+from tqdm import tqdm
+
+
+def get_save_paths(save_name, parameters=None):
+    parameters = load_parameters(parameters)
+    results_dir = parameters["results_dir"] + "/predictions/"
+    os.makedirs(results_dir, exist_ok=True)
+    save_path = os.path.abspath(os.path.join(results_dir, f"{save_name}.jsonl"))
+    return save_path
+
+
+def word_count(s):
+    return len(s.split())
+
+
+def interactive(model, runner, header, train_examples, max_iterations=20, max_previous_results=10, prev_hypothesis=None, critique=None
+):
+    prev_results = []
+    for example in train_examples:
+        prev_results.append((example[0], example[1], None))
+    reasoning_prompt = get_interactive_starting_prompt(header, prev_results, full_fill=False, critique=critique)
+    concluded = False
+    if prev_hypothesis is None:
+        hypothesis = "Not yet formed"
+    else:
+        hypothesis = prev_hypothesis
+    input_prompt = f"""
+You are given a Python function with the following header:
+{header}
+Your task is to try various inputs to discover what this function does.
+
+So far, you have tried the following inputs: [PREV]
+You then came up with the following running hypothesis: [HYPOTHESIS]
+
+Based on this, you wanted to try the following kind of input next: [REASONING]. 
+Now, give the exact input to test the function with next.
+The input should be valid Python tuples and your output should follow the format below.
+Suggested Input:
+(arg0, arg1) [STOP] #(arg0, arg1) should be replaced with actual input values in your response and must be a valid python tuple. This is an example format for a two arg function. You should adjust the number of arguments as per the function definition.
+Now provide your suggested inputs below and then say [STOP]
+Suggested Input:"""
+
+    reflection_prompt = f"""
+You are given a Python function with the following header:
+{header}
+Your task is to try various inputs to discover what this function does.
+
+So far, you have tried the following inputs: [PREV]
+You then came up with the following running hypothesis: [HYPOTHESIS]
+You wanted to test this, with an input coming from the reasoning: [REASONING]
+Finally, you just tried the following inputs: [LAST_INPUTS]
+
+Based on this, can you conclude with very high confidence what the function does? If the function did not perform as you expected, the answer is likely no. If you think it is yes, then say YES and provide a concise description of its functionality.
+Else, say NO and provide a revised hypothesis of what you think the function may do, and some guidance on how to test this further.
+Format Example:
+Hypothesis Conclusion: YES/NO
+Summary: <your extremely concise summary or brief revised hypothesis here>
+[STOP]
+
+Now, provide your conclusion below, remember to say [STOP] after your summary.
+Hypothesis Conclusion: """
+    columns = ["prompt", "output", "is_good"]
+    data = []
+    for i in tqdm(range(max_iterations), desc="Function Discovery", leave=False):
+        prev_results_str = get_prev_results_str(prev_results, max_previous_results)
+        prompt = reasoning_prompt.replace("[PREV]", prev_results_str).replace(
+            "[HYPOTHESIS]", hypothesis
+        )
+        response = model.infer(prompt, max_new_tokens=300)
+        reasoning = response.split("[STOP]")[0].strip()
+        data.append([prompt, reasoning + "\n[STOP]", word_count(reasoning) < 250])
+        prompt = (
+            input_prompt.replace("[PREV]", prev_results_str)
+            .replace("[HYPOTHESIS]", hypothesis)
+            .replace("[REASONING]", reasoning)
+        )
+        response = model.infer(prompt, max_new_tokens=300)
+        suggested_inputs = None
+        options = response.strip().split("\n")
+        for opt in options:
+            if opt.count("input:") == 1 or opt.count("Input:") == 1:
+                if opt.count("input:") == 1:
+                    opt = opt.split("input:")[1].strip()
+                else:
+                    opt = opt.split("Input:")[1].strip()
+                if opt.strip() != "":
+                    suggested_inputs = opt
+                    break
+        if suggested_inputs is None:  # then empty string
+            # one last effort, see if any of the options fit ()
+            for opt in options:
+                if "(" in opt:
+                    if ")" in opt[opt.index("("):]:
+                        suggested_inputs = opt[opt.index("("):opt.rindex(")")+1].strip()
+                        break
+            if suggested_inputs is None:
+                last_input_str = "Invalid input suggested: " + response.strip()
+                log_warn(f"Could not parse suggested input from model response: {response.strip()}")
+        # print(f"Suggested inputs: {suggested_inputs}")
+        ret, err = runner.run_test_str(suggested_inputs)
+        data.append([prompt, response + "\n[STOP]", err is not None])
+        prev_results.append((suggested_inputs, ret, err))
+        last_input_str = (
+            "Input: " + suggested_inputs
+            if suggested_inputs is not None
+            else "None" + f" => Output: {ret}, Error: {err}"
+        )
+        reflection = (
+            reflection_prompt.replace("[PREV]", prev_results_str)
+            .replace("[HYPOTHESIS]", hypothesis)
+            .replace("[LAST_INPUTS]", last_input_str)
+            .replace("[REASONING]", reasoning)
+        )
+        reflection_response = model.infer(reflection, max_new_tokens=300)
+        data.append(
+            [
+                reflection,
+                reflection_response + "\n[STOP]",
+                word_count(reflection_response) < 250
+                and reflection_response.lower().count("summary:") == 1,
+            ]
+        )
+        if reflection_response.lower().count("summary:") == 1:
+            decision, summary = (
+                reflection_response.lower().split("summary:")[0].strip(),
+                reflection_response.lower().split("summary:")[1].strip(),
+            )
+            hypothesis = summary
+        else:
+            hypothesis = reflection_response.lower()
+            decision = "no"
+        if False:
+            print(f"Iteration {i + 1}:")
+            print(f"Reasoning: {reasoning}")
+            print(f"Suggested inputs: {suggested_inputs}")
+            print(f"Function output: {ret}, Error: {err}")
+            print(f"Reflection response: {reflection_response}")
+        if "yes" in decision:
+            concluded = True
+            break
+        else:
+            pass
+    steps = pd.DataFrame(data=data, columns=columns)
+    return hypothesis, runner.access_counter, concluded, steps, prev_results
+
+
+@click.command()
+@click.option("--model_name", type=str, required=True, help="Name of the model to use.")
+@click.option(
+    "--save_name", type=str, default=None, help="Name to save the predictions under."
+)
+@click.option(
+    "--load_name", type=str, default=None, help="Name to save the predictions under."
+)
+@click.option(
+    "--override_gen", is_flag=True, help="Whether to override existing generation."
+)
+def run_memory(model_name, save_name, load_name, override_gen):
+    parameters = load_parameters()
+    load_path = get_save_paths(load_name, parameters)
+    save_path = get_save_paths(save_name, parameters)
+    if os.path.exists(save_path) and not override_gen:
+        log_info(
+            f"Output file {save_path} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+        return
+    checkpoint_path = save_path.replace(".jsonl", "_checkpoint.jsonl")
+    output_column = "predicted_description"
+    start_index = 0
+    model = get_lm(model_name)
+    dataset = load_dataset_df(load_path)
+    dataset["prev_hypothesis"] = dataset["predicted_description"]
+    dataset["prev_examples"] = dataset["all_examples"]
+    columns = [
+        "n_queries",
+        "concluded",
+        "predicted_description",
+        "steps",
+        "all_examples", 
+        "critique"
+    ]
+    for column in columns:
+        dataset[column] = None
+    start_index = 0
+    if os.path.exists(checkpoint_path) and not override_gen:
+        log_info(f"Checkpoint file {checkpoint_path} found, resuming from checkpoint.")
+        dataset = load_dataset_df(checkpoint_path)
+        # look from the end and identify the first non None predicted_description and set start_index to that + 1
+        description_nans = dataset["predicted_description"].isna()
+        for i in range(len(dataset) - 1, -1, -1):
+            if not description_nans[i]:
+                start_index = i + 1
+                break
+        if start_index >= len(dataset):
+            log_info(
+                f"All rows in checkpoint file {checkpoint_path} already have predictions, skipping generation. Run with override_gen=True to re-evaluate."
+            )
+            save_dataset_df(dataset, save_path)
+            log_info(f"Saved predictions to {save_path}")
+            return
+    dataset["concluded"] = dataset["concluded"].astype(bool)
+    for i, row in tqdm(
+        dataset.iterrows(),
+        total=len(dataset),
+        desc=f"Evaluating {save_name}",
+    ):
+        if i < start_index:
+            continue
+        critique = get_critique_from_row(model, row)
+        row["critique"] = critique        
+        predicted_description, n_queries, concluded, step_df, all_examples = get_interactive_from_row(model, row)
+        if predicted_description is None:
+            continue
+        steps = step_df.to_dict(orient="records")
+        repr_examples = []
+        for suggested_input, output, error in all_examples:
+            try:
+                repr_examples.append(
+                    (repr(suggested_input), repr(output), repr(error))
+                )
+            except:
+                continue
+        dataset.at[i, "predicted_description"] = predicted_description
+        dataset.at[i, "n_queries"] = n_queries
+        dataset.at[i, "concluded"] = bool(concluded)
+        dataset.at[i, "steps"] = steps
+        dataset.at[i, "all_examples"] = repr_examples
+        dataset.at[i, "critique"] = critique
+        save_dataset_df(dataset.copy(), checkpoint_path, verbose=False)
+    save_dataset_df(dataset, save_path)
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    log_info(f"Saved predictions to {save_path}")
+    return save_path
+
+
+
+
+@click.command()
+@click.option("--model_name", type=str, required=True, help="Name of the model to use.")
+@click.option(
+    "--save_name", type=str, default=None, help="Name to save the predictions under."
+)
+@click.option(
+    "--override_gen", is_flag=True, help="Whether to override existing generation."
+)
+def run_incontext(model_name, save_name, override_gen):
+    parameters = load_parameters()
+    model_save_name = model_name.split("/")[-1].strip()
+    save_name = model_save_name if save_name is None else save_name
+    save_path = get_save_paths(save_name, parameters)
+    if os.path.exists(save_path) and not override_gen:
+        log_info(
+            f"Output file {save_path} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+    else:
+        output_file = save_path
+        df = get_dataset("debug" if parameters["debug"] else "test", parameters=parameters)
+        model = get_lm(model_name)
+        for i, row in tqdm(df.iterrows(), total=len(df), desc="Running Inference"):
+            df.loc[i, "predicted_description"] = model.infer(
+                row["direct_prompt"], max_new_tokens=300
+            )
+        save_dataset_df(df, output_file)
+        log_info(f"Saved predictions to {output_file}")
+        return
+
+
+
+def critique(model, train_dataset, train_idx):
+    critique_prompt = """
+    You were given the task of discovering what a function does by trying various inputs. 
+    The true functionality was: [TRUE]
+
+    This could have be seen with examples such as: [TRUE_EXAMPLES]
+
+    You tried a different set of examples: [PREV_EXAMPLES]
+
+    Based on which you predicted that the function does: [PREDICTED]
+
+    Was your prediction accurate? If you misunderstood the function somehow, what was lacking in the set of input examples you used to explore the function?
+
+    Write a short and concise critique of your exploration examples that is specific, and mentions the high level thinking strategies that you should have adopted to more reliably come to the true answer. 
+
+    Give your response in the following format:
+
+    Critique: <short and precise critique here with comments on how to improve>
+    [STOP]
+    Now give your critique. 
+
+    Critique: 
+    """
+    train_row = train_dataset.loc[train_idx]
+    hypothesis, access_counter, concluded, steps, prev_results = get_interactive_from_row(model, train_row)
+    prev_results_str = get_prev_results_str(prev_results)
+    test_examples = []
+    for inp, out in train_row["test_examples"]:
+        test_examples.append((inp, out, None))
+    true_results = get_prev_results_str(test_examples)
+    true_description = train_row["description"]
+    if hypothesis is None:
+        hypothesis = "None"
+    critique_prompt = critique_prompt.replace("[TRUE]", true_description).replace("[TRUE_EXAMPLES]", true_results).replace("[PREV_EXAMPLES]", prev_results_str).replace("[PREDICTED]", hypothesis)
+    model_critique = model.infer(critique_prompt, max_new_tokens=300)
+    return model_critique
+
+
+def get_critique_from_row(model, row):
+    dataset = get_dataset("train")
+    use_idxes = row["retrieved_train_indices"]
+    critiques = []
+    for idx in use_idxes:
+        ind_critique = critique(model, dataset, idx)
+        critiques.append(ind_critique)
+    if len(critiques) > 1:
+        summarize_prompt = """
+        Here are several critiques you recieved while exploring inputs to test and understand a black box function:
+        [CRITIQUES]
+
+        Given this, write yourself a single, unified critique that organizes the previous feedback and consolidates it in a concise and helpful manner
+
+        Your response should be in the format:
+        Critique: Short and concise summary of the previous feedback
+        [STOP]
+
+        Now give your consolidated critique. 
+        Critique:
+        """
+        critiques_str = "\n".join([f"{i+1}. {c}" for i, c in enumerate(critiques)])
+        summarize_prompt = summarize_prompt.replace("[CRITIQUES]", critiques_str)
+        return model.infer(summarize_prompt, max_new_tokens=300)
+    else:
+        return critiques[0]
+
+
+def get_interactive_from_row(model, row):
+    test_func_str = row["test_func_validated"]
+    train_examples = row["train_examples"]
+    header = row["header"]
+    prev_hypothesis = None
+    critique = None
+    try:
+        runner = RunTestFunc(test_func_str, timeout=30)
+    except Exception as e:
+        log_warn(f"Error creating runner for test_func {test_func_str} \nError: {e}")
+        return None, None, None, None, None
+    if "critique" in row:
+        prev_hypothesis = row["prev_hypothesis"]
+        critique = row["critique"]
+        train_examples = row["prev_examples"]    
+    return interactive(model, runner, header, train_examples, prev_hypothesis=prev_hypothesis, critique=critique)
+
+
+@click.command()
+@click.option("--model_name", type=str, required=True, help="Name of the model to use.")
+@click.option(
+    "--save_name", type=str, default=None, help="Name to save the predictions under."
+)
+@click.option(
+    "--override_gen", is_flag=True, help="Whether to override existing generation."
+)
+def run_interactive(model_name, save_name, override_gen):
+    parameters = load_parameters()
+    model_save_name = model_name.split("/")[-1].strip()
+    if save_name is None:
+        save_name = model_save_name
+    save_path = get_save_paths(save_name)
+    checkpoint_path = save_path.replace(".jsonl", "_checkpoint.jsonl")
+    file_makedir(save_path)
+    if os.path.exists(save_path) and not override_gen:
+        log_info(
+            f"Output file {save_path} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+    else:
+        model = get_lm(model_name)
+        dataset = get_dataset("debug" if parameters["debug"] else "test", parameters=parameters)
+        dataset = dataset.reset_index(drop=True)
+        columns = [
+            "n_queries",
+            "concluded",
+            "predicted_description",
+            "steps",
+            "all_examples"
+        ]
+        for column in columns:
+            dataset[column] = None
+        start_index = 0
+        if os.path.exists(checkpoint_path) and not override_gen:
+            log_info(f"Checkpoint file {checkpoint_path} found, resuming from checkpoint.")
+            dataset = load_dataset_df(checkpoint_path)
+            # look from the end and identify the first non None predicted_description and set start_index to that + 1
+            description_nans = dataset["predicted_description"].isna()
+            for i in range(len(dataset) - 1, -1, -1):
+                if not description_nans[i]:
+                    start_index = i + 1
+                    break
+            if start_index >= len(dataset):
+                log_info(
+                    f"All rows in checkpoint file {checkpoint_path} already have predictions, skipping generation. Run with override_gen=True to re-evaluate."
+                )
+                save_dataset_df(dataset, save_path)
+                log_info(f"Saved predictions to {save_path}")
+                return
+        dataset["concluded"] = dataset["concluded"].astype(bool)
+        for i, row in tqdm(
+            dataset.iterrows(),
+            total=len(dataset),
+            desc=f"Evaluating {save_name}",
+        ):
+            if i < start_index:
+                continue
+            predicted_description, n_queries, concluded, step_df, all_examples = get_interactive_from_row(model, row)
+            if predicted_description is None:
+                continue
+            steps = step_df.to_dict(orient="records")
+            repr_examples = []
+            for suggested_input, output, error in all_examples:
+                try:
+                    repr_examples.append(
+                        (repr(suggested_input), repr(output), repr(error))
+                    )
+                except:
+                    continue
+            dataset.at[i, "predicted_description"] = predicted_description
+            dataset.at[i, "n_queries"] = n_queries
+            dataset.at[i, "concluded"] = bool(concluded)
+            dataset.at[i, "steps"] = steps
+            dataset.at[i, "all_examples"] = repr_examples
+            save_dataset_df(dataset.copy(), checkpoint_path, verbose=False)
+        save_dataset_df(dataset, save_path)
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+        log_info(f"Saved predictions to {save_path}")
+    return save_path
+
+
+@click.command()
+@click.option("--model_name", type=str, default=None, help="Name of the model to use.")
+@click.option(
+    "--sample_perc",
+    type=float,
+    default=1,
+    help="Percentage of the dataset to sample for evaluation.",
+)
+@click.option(
+    "--override_gen", is_flag=True, help="Whether to override existing generation."
+)
+def create_interactive_training_data(model_name, sample_perc, override_gen):
+    parameters = load_parameters()
+    if model_name is None:
+        model_name = parameters["benchmark_creation_model"]
+    model_save_name = model_name.split("/")[-1].strip()
+    save_path = (
+        parameters["data_dir"] + f"/finetuning/{model_save_name}.csv"
+    )
+    if os.path.exists(save_path) and not override_gen:
+        log_info(
+            f"Output file {save_path} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+    else:
+        dataset = get_dataset("debug" if parameters["debug"] else "train", parameters=parameters)
+        dataset = dataset.sample(frac=sample_perc, random_state=parameters["random_seed"]).reset_index(drop=True)
+        model = get_lm(model_name)
+        columns = ["input", "output"]
+        data = []
+        for i, row in tqdm(
+            dataset.iterrows(),
+            total=len(dataset),
+            desc=f"Creating training data from {model_name}",
+        ):
+            predicted_description, n_queries, concluded, step_df, all_examples = get_interactive_from_row(model, row)
+            if predicted_description is None:
+                continue
+            step_df = step_df[step_df["is_good"] == True]
+            for _, step_row in step_df.iterrows():
+                data.append([step_row["prompt"], step_row["output"]])
+        df = pd.DataFrame(data=data, columns=columns)
+        df.to_csv(save_path, index=False)
+        log_info(f"Saved finetuning data to {save_path}")
+    return save_path
+
+
+code_prediction_prompt = """
+You are an expert programmer. Your goal is to create a Python function called `test_func` that matches the following description:
+[DESCRIPTION]
+
+The header of the function must be:
+[HEADER]
+
+The function must satisfy the following input-output examples:
+[EXAMPLES]
+
+Now, write the complete code for the function `test_func` that meets the above requirements. You should structure your response as follows:
+Reasoning: <any brief thinking or reasoning you want to do before writing the code. This must be extremely brief and concise, just a sentence or two at most>
+Code:
+```python
+<your code here>
+```
+[STOP] # make sure to include the [STOP] token at the end of your response to indicate that you have finished writing the code.
+Now, provide your reasoning and code below, and remember to end with [STOP].
+Reasoning: 
+"""
+
+
+def run_extract_code(
+    model_name: str,
+    output_file: str,
+    override_gen: bool,
+    df: pd.DataFrame,
+    prompt_column: str,
+    output_column: str = "predicted_code_output",
+    max_new_tokens: int = 600,
+):
+    """
+    Common function for running code prediction evaluation.
+    Takes a DataFrame with prompts, runs inference, extracts code, and saves results.
+    """
+    if os.path.exists(output_file) and not override_gen:
+        log_info(
+            f"Output file {output_file} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+        return df
+    checkpoint_path = output_file.replace(".jsonl", "_checkpoint.jsonl")
+    start_index = 0
+    if os.path.exists(checkpoint_path) and not override_gen:
+        log_info(f"Checkpoint file {checkpoint_path} found, resuming from checkpoint.")
+        df = load_dataset_df(checkpoint_path)
+        output_col_nans = df[output_column].isna()
+        for i in range(len(df) - 1, -1, -1):
+            if not output_col_nans[i]:
+                start_index = i + 1
+                break
+    model = get_lm(model_name)
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Generating Code"):
+        if i < start_index:
+            continue
+        prompt = row[prompt_column]
+        response = model.infer(prompt, max_new_tokens=max_new_tokens)
+        df.at[i, output_column] = response
+        save_dataset_df(df.copy(), checkpoint_path, verbose=False)
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    parse_errors = 0
+
+    def extract_code(row):
+        response = row[output_column]
+        if isinstance(response, list):
+            response = response[0]
+        if "[STOP]" in response:
+            code_part = response.split("[STOP]")[0]
+        else:
+            code_part = response
+        if "```python" in code_part and "```" in code_part.split("```python")[-1]:
+            code = code_part.split("```python")[1].split("```")[0].strip()
+            return code
+        elif code_part.count("```") == 2:
+            code = code_part.split("```")[1].strip()
+            return code
+        elif code_part.count("```") == 1:
+            code = code_part.split("```")[1].strip()
+            return code
+        else:
+            return None
+
+    df["predicted_code"] = None
+    for i, row in df.iterrows():
+        code = extract_code(row)
+        if code is not None:
+            df.at[i, "predicted_code"] = code
+        else:
+            parse_errors += 1
+    save_dataset_df(df, output_file)
+    log_info(
+        f"Saved predicted code to {output_file} | Parse errors: {parse_errors}/{len(df)}"
+    )
+    return df
+
+
+def get_code_model(model_name):
+    if model_name is None:
+        parameters = load_parameters()
+        code_generation_model = parameters["code_generation_model_name"]
+        return code_generation_model
+    else:
+        return model_name
+
+
+def do_predict_code(
+    model_name,
+    save_name,
+    load_name,
+    gold,
+    override_gen,
+):
+    if gold:
+        prediction_column = "description"
+        save_name = f"gold_{save_name}"
+    else:
+        prediction_column = "predicted_description"
+    code_generation_model = get_code_model(model_name)
+    if load_name is None:
+        parameters = load_parameters()
+        if parameters["debug"]:
+            log_warn(f"DEBUG MODE ACTIVE")
+        df = get_dataset("debug" if parameters["debug"] else "test", parameters=parameters)
+    else:
+        prediction_file = get_save_paths(load_name)
+        if not os.path.exists(prediction_file):
+            log_error(f"{prediction_file} not found")
+        df = load_dataset_df(prediction_file)
+    output_file = get_save_paths(save_name)    
+    if os.path.exists(output_file) and not override_gen:
+        log_info(
+            f"Output file {output_file} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+        return    
+
+    def make_code_prompt(row):
+        func_header = row["header"]
+        examples_str = get_prev_results_str(row["all_examples"])
+        use_description = row[prediction_column]
+
+        if use_description is None:
+            log_warn(f"Row has no description, using None instead for code generation prompt.")
+            use_description = "None"       
+        if func_header is None:
+            log_error(f"Row has no function header")
+        if examples_str is None:
+            log_error(f"Row has no examples")
+        prompt = (
+            code_prediction_prompt.replace("[DESCRIPTION]", use_description)
+            .replace("[HEADER]", func_header)
+            .replace("[EXAMPLES]", examples_str)
+        )
+        return prompt
+
+    df["code_prediction_prompt"] = df.apply(make_code_prompt, axis=1)
+    run_extract_code(
+        model_name=code_generation_model,
+        override_gen=override_gen,
+        output_file=output_file,
+        df=df,
+        prompt_column="code_prediction_prompt",
+        output_column="predicted_code_output",
+        max_new_tokens=600,
+    )
+
+
+@click.command()
+@click.option("--model_name", type=str, default=None, help="Name of the model to use.")
+@click.option(
+    "--save_name", type=str, required=True, help="Name to save the predictions under."
+)
+@click.option(
+    "--load_name", type=str, default=None, help="Name to load the predictions from."
+)
+@click.option(
+    "--gold", is_flag=True, help="Whether to use true descriptions."
+)
+@click.option(
+    "--override_gen", is_flag=True, help="Whether to override existing generation."
+)
+def predict_code(model_name, save_name, load_name, gold, override_gen):
+    if load_name is None and not gold:
+        log_error(f"if gold is none, load_name must be provided")
+    do_predict_code(
+        model_name,
+        save_name,
+        load_name,
+        gold,
+        override_gen,
+    )
+
+
+output_prediction_prompt = """
+You are an expert programmer. Your goal is to reason about a function that matches the following description:
+[DESCRIPTION]
+
+The function satisfies the following input-output examples:
+[EXAMPLES]
+
+Now, here is a new input to the function: 
+[INPUT]
+What is the expected output of the function on this input?
+Your response should follow the format below:
+Reasoning: <any brief thinking or reasoning you want to do before giving the output. This must be extremely brief and concise, just a sentence or two at most>
+Expected Output: <the expected output here. This must be a valid python expression that will match the output of the function when evaluated.>
+[STOP] # make sure to include the [STOP] token at the end of your response to indicate that you have finished giving the expected output.
+Now, provide your reasoning and expected output below, and remember to end with [STOP].
+Reasoning: 
+"""
+
+input_prediction_prompt = """
+You are an expert programmer. Your goal is to reason about a function that matches the following description:
+[DESCRIPTION]
+
+The header of the function is:
+[HEADER]
+
+The function satisfies the following input-output examples:
+[EXAMPLES]
+
+Now, here is a new output from the function:
+[OUTPUT]
+What is an input that would produce this output when passed through the function? Your response should follow the format below:
+Reasoning: <any brief thinking or reasoning you want to do before giving the input. This must be extremely brief and concise, just a sentence or two at most>
+Suggested Input: <the suggested input here. This must be a valid python tuple that can be evaluated and inputed into the function with the correct number of arguments. For example, if the function takes two arguments, your suggested input should be a tuple like (arg0, arg1) with appropriate values for arg0 and arg1.>
+[STOP] # make sure to include the [STOP] token at the end of your response to indicate that you have finished giving the suggested input.
+Now, provide your reasoning and suggested input below
+Reasoning:
+"""
+
+
+def run_predict_output(
+    model_name: str,
+    output_file: str,
+    df: pd.DataFrame,
+    prompt_column: str,
+    prediction_file: str,
+    output_column: str = "predicted_output_output",
+    max_new_tokens: int = 300,
+    override_gen: bool = False,
+):
+    """
+    Common function for running output prediction evaluation.
+    """
+    if os.path.exists(output_file) and not override_gen:
+        log_info(
+            f"Output file {output_file} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+        return load_dataset_df(output_file)
+    checkpoint_path = output_file.replace(".jsonl", "_checkpoint.jsonl")
+    start_index = 0
+    if os.path.exists(checkpoint_path) and not override_gen:
+        log_info(f"Checkpoint file {checkpoint_path} found, resuming from checkpoint.")
+        df = load_dataset_df(checkpoint_path)
+        output_col_nans = df[output_column].isna()
+        for i in range(len(df) - 1, -1, -1):
+            if not output_col_nans[i]:
+                start_index = i + 1
+                break
+    else:
+        df["original_index"] = df.index
+        df = df.reset_index(drop=True)
+    model = get_lm(model_name)
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Generating Output Predictions"):
+        if i < start_index:
+            continue
+        prompt = row[prompt_column]
+        response = model.infer(prompt, max_new_tokens=max_new_tokens)
+        df.at[i, output_column] = response
+        save_dataset_df(df.copy(), checkpoint_path, verbose=False)
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    parse_errors = 0
+
+    def extract_output(row):
+        response = row[output_column]
+        if isinstance(response, list):
+            response = response[0]
+        if "[STOP]" in response:
+            output_part = response.split("[STOP]")[0]
+        else:
+            output_part = response
+        if "Expected Output:" in output_part:
+            expected_output = output_part.split("Expected Output:")[1].strip()
+            return expected_output
+        else:
+            return None
+    parse_errors = 0
+    df["predicted_output"] = None
+    for i, row in df.iterrows():
+        expected_output = extract_output(row)
+        if expected_output is not None:
+            df.at[i, "predicted_output"] = expected_output
+        else:
+            parse_errors += 1
+    df = df.groupby(df["original_index"]).agg({"predicted_output": list}).reset_index()
+    original_df = load_dataset_df(prediction_file)
+    original_df["predicted_output"] = df["predicted_output"]
+    save_dataset_df(original_df, output_file)
+    log_info(
+        f"Saved predicted outputs to {output_file} | Parse errors: {parse_errors}/{len(df)}"
+    )
+    return original_df
+
+
+def get_output_model(model_name):
+    if model_name is None:
+        parameters = load_parameters()
+        return parameters["input_output_prediction_model_name"]
+    else:
+        return model_name
+
+
+def do_predict_output(
+    model_name, save_name, load_name, gold, override_gen,
+):
+    if gold:
+        prediction_column = "description"
+        save_name = f"gold_{save_name}"
+    else:
+        prediction_column = "predicted_description"
+    input_output_model = get_output_model(model_name)
+    prediction_file = get_save_paths(load_name)
+    if not os.path.exists(prediction_file):
+        log_error(f"{prediction_file} not found")
+    output_file = get_save_paths(save_name)
+    if os.path.exists(output_file) and not override_gen:
+        log_info(
+            f"Output file {output_file} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+        return
+    df = load_dataset_df(prediction_file)
+
+    def make_predict_output_prompt(row):
+        examples_str = get_prev_results_str(row["all_examples"])
+        use_description = row[prediction_column]
+        prompt = output_prediction_prompt.replace(
+            "[DESCRIPTION]", use_description
+        ).replace("[EXAMPLES]", examples_str)
+        return prompt
+
+    df["predict_output_prompt"] = df.apply(make_predict_output_prompt, axis=1)
+    # now we need to explode the dataframe so that we have one row per example input-output pair, since we want to predict the output for each example input separately
+    df = df.explode("test_examples")
+    df["predict_output_prompt"] = df.apply(
+        lambda row: row["predict_output_prompt"].replace(
+            "[INPUT]", f"{row['test_examples'][0]}"
+        ),
+        axis=1,
+    )
+    run_predict_output(
+        model_name=input_output_model,
+        output_file=output_file,
+        df=df,
+        prompt_column="predict_output_prompt",
+        prediction_file=prediction_file,
+        output_column="predicted_output_output",
+        max_new_tokens=300,
+        override_gen=override_gen
+    )
+
+
+def run_predict_input(
+    model_name: str,
+    override_gen: bool,
+    output_file: str,
+    df: pd.DataFrame,
+    prompt_column: str,
+    prediction_file: str,
+    output_column: str = "predicted_input_output",
+    max_new_tokens: int = 300,
+):
+    """
+    Common function for running input prediction evaluation.
+    """
+    checkpoint_path = output_file.replace(".jsonl", "_checkpoint.jsonl")
+    start_index = 0
+    if os.path.exists(checkpoint_path) and not override_gen:
+        log_info(f"Checkpoint file {checkpoint_path} found, resuming from checkpoint.")
+        df = load_dataset_df(checkpoint_path)
+        output_col_nans = df[output_column].isna()
+        for i in range(len(df) - 1, -1, -1):
+            if not output_col_nans[i]:
+                start_index = i + 1
+                break
+    else:
+        df["original_index"] = df.index
+        df = df.reset_index(drop=True)
+    model = get_lm(model_name)
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Generating Input Predictions"):
+        if i < start_index:
+            continue
+        prompt = row[prompt_column]
+        response = model.infer(prompt, max_new_tokens=max_new_tokens)
+        df.at[i, output_column] = response
+        save_dataset_df(df.copy(), checkpoint_path, verbose=False)
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+
+    def extract_input(row):
+        true_description = row["description"]
+        response = row[output_column]
+        if isinstance(response, list):
+            response = response[0]
+        if "[STOP]" in response:
+            input_part = response.split("[STOP]")[0]
+        else:
+            input_part = response
+        if "input:" in input_part.lower():
+            if "Input:" in input_part:
+                suggested_input = input_part.split("Input:")[1].strip()
+            else:
+                suggested_input = input_part.split("input:")[1].strip()
+            return suggested_input
+        else:
+            return None
+
+    parse_errors = 0
+    df["predicted_input"] = None
+    for i, row in df.iterrows():
+        predicted_input = extract_input(row)
+        if predicted_input is not None:
+            df.at[i, "predicted_input"] = predicted_input
+        else:
+            parse_errors += 1
+    df = df.groupby(df["original_index"]).agg({"predicted_input": list}).reset_index()
+    original_df = load_dataset_df(prediction_file)
+    original_df["predicted_input"] = df["predicted_input"]
+    save_dataset_df(original_df, output_file)
+    log_info(
+        f"Saved predicted inputs to {output_file} | Parse errors: {parse_errors}/{len(df)}"
+    )
+    return original_df
+
+
+def get_input_model(model_name):
+    if model_name is None:
+        parameters = load_parameters()
+        return parameters["input_output_prediction_model_name"]
+    else:
+        return model_name
+
+
+def do_predict_input(
+    model_name, save_name, load_name, gold, override_gen,
+):
+    if gold:
+        prediction_column = "description"
+        save_name = f"gold_{save_name}"
+    else:
+        prediction_column = "predicted_description"
+    input_output_model = get_input_model(model_name)
+    prediction_file = get_save_paths(load_name)
+    if not os.path.exists(prediction_file):
+        log_error(f"{prediction_file} not found")
+    output_file = get_save_paths(save_name)
+    if os.path.exists(output_file) and not override_gen:
+        log_info(
+            f"Output file {output_file} already exists, skipping generation. Run with override_gen=True to re-evaluate."
+        )
+        return
+    df = load_dataset_df(prediction_file)
+
+    def make_predict_input_prompt(row):
+        func_header = row["header"]
+        examples_str = get_prev_results_str(row["all_examples"])
+        use_description = row[prediction_column]
+        prompt = (
+            input_prediction_prompt.replace("[DESCRIPTION]", use_description)
+            .replace("[HEADER]", func_header)
+            .replace("[EXAMPLES]", examples_str)
+        )
+        return prompt
+
+    df["predict_input_prompt"] = df.apply(make_predict_input_prompt, axis=1)
+    # explode and use target_outputs as the new output to predict the input for
+    df = df.explode("test_examples")
+    df["predict_input_prompt"] = df.apply(
+        lambda row: row["predict_input_prompt"].replace(
+            "[OUTPUT]", f"{row['test_examples'][1]}"
+        ),
+        axis=1,
+    )
+    run_predict_input(
+        model_name=input_output_model,
+        override_gen=override_gen,
+        output_file=output_file,
+        df=df,
+        prompt_column="predict_input_prompt",
+        prediction_file=prediction_file,
+        output_column="predicted_input_output",
+        max_new_tokens=300,
+    )
+
+
+@click.command()
+@click.option("--model_name", type=str, default=None, help="Name of the model to use.")
+@click.option(
+    "--save_name", type=str, required=True, help="Name to save the predictions under."
+)
+@click.option(
+    "--load_name", type=str, required=True, help="Name to load the predictions from."
+)
+@click.option(
+    "--gold", is_flag=True, help="Whether to use true descriptions."
+)
+@click.option(
+    "--override_gen", is_flag=True, help="Whether to override existing generation."
+)
+def predict_output(model_name, save_name, load_name, gold, override_gen):
+    do_predict_output(
+        model_name,
+        save_name,
+        load_name,
+        gold,
+        override_gen,
+    )
+
+
+@click.command()
+@click.option("--model_name", type=str, default=None, help="Name of the model to use.")
+@click.option(
+    "--save_name", type=str, required=True, help="Name to save the predictions under."
+)
+@click.option(
+    "--load_name", type=str, required=True, help="Name to load the predictions from."
+)
+@click.option(
+    "--gold", is_flag=True, help="Whether to use true descriptions."
+)
+@click.option(
+    "--override_gen", is_flag=True, help="Whether to override existing generation."
+)
+def predict_input(model_name, save_name, load_name, gold, override_gen):
+    do_predict_input(
+        model_name,
+        save_name,
+        load_name,
+        gold,
+        override_gen,
+    )
+
+
+@click.group()
+def cli():
+    pass
+
+
+cli.add_command(run_incontext, name="incontext")
+cli.add_command(run_interactive, name="interactive")
+cli.add_command(run_memory, name="memory")
+cli.add_command(predict_code, name="code")
+cli.add_command(predict_output, name="output")
+cli.add_command(predict_input, name="input")
+cli.add_command(create_interactive_training_data, name="create")
+
+
+if __name__ == "__main__":
+    cli()
