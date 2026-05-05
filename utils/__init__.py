@@ -7,11 +7,11 @@ from utils.fundamental import file_makedir
 import multiprocessing
 from ast import literal_eval
 
-# from utils.lm_inference import (
-#    model_factory,
-#    get_lm,
-#    call_infer
-# )
+from utils.lm_inference import (
+   model_factory,
+   get_lm,
+   call_infer
+)
 
 
 def get_test_func_header(func_code):
